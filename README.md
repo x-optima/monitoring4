@@ -52,3 +52,12 @@ UPD:
 +--------------+---------------+--------------+--------------+
 |         2005 |             7 |     28368.91 |         6709 |
 +--------------+---------------+--------------+--------------+
+
+UPD2:
+Добавил через DATE_FORMAT
+
+`SELECT DATE_FORMAT(payment_date, ‘%Y-%m’) AS payment_month, SUM(amount) AS total_amount,  Count(*)AS rental_count`
+`FROM sakila.payment`
+`GROUP BY payment_month`
+`ORDER BY total_amount DESC`
+`LIMIT 1;`
