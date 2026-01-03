@@ -1,0 +1,299 @@
+# Запускаем командой ansible-playbook -i hosts.ini playbook1.yml --ask-vault-pass
+
+- name: playbook1
+  gather_facts: true
+  hosts: servers
+  vars:
+    ansible_ssh_user: yc-user
+
+  become: yes
+
+  pre_tasks:
+    - name: Validating the ssh port is open
+      wait_for:
+        host: "{{ (ansible_ssh_host|default(ansible_host))|default(inventory_hostname) }}"
+        port: 22
+        delay: 5
+        timeout: 300
+        state: started
+        search_regex: OpenSSH
+
+  tasks:
+    - name: Загрузить переменные из файла
+      ansible.builtin.include_vars:
+        file: vars.yml
+
+    - name: Полная очистка Docker репозиториев (радикально)
+      ansible.builtin.shell: |
+        sudo rm -f /etc/apt/sources.list.d/*docker*
+        sudo rm -f /etc/apt/sources.list.d/docker*
+        sudo rm -f /etc/apt/sources.list.d/download*
+        sudo rm -f /etc/apt/keyrings/docker*
+        sudo apt update --allow-releaseinfo-change
+      become: yes
+      ignore_errors: yes
+
+    - name: Очистить APT кэш полностью
+      ansible.builtin.command: apt clean
+      become: yes
+
+    - name: Установить базовые зависимости
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: no  # ← Без update_cache!
+      become: yes
+
+    - name: Создать keyrings директорию
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+      become: yes
+
+    - name: Добавить Docker GPG (официальный)
+      ansible.builtin.shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+      become: yes
+
+    - name: Права на GPG ключ
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/docker.gpg
+        mode: '0644'
+      become: yes
+
+    - name: Создать ЧИСТЫЙ Docker репозиторий
+      ansible.builtin.copy:
+        content: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        dest: /etc/apt/sources.list.d/docker.list
+      become: yes
+
+    - name: ТЕПЕРЬ обновить APT
+      ansible.builtin.apt:
+        update_cache: yes
+      become: yes
+
+
+    - name: Установить Docker CE + Compose
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+      become: yes
+
+        
+    - name: Добавить yc-user в группу docker
+      ansible.builtin.user:
+        name: yc-user
+        groups: docker
+        append: yes
+      become: yes
+
+    - name: Перезапустить docker после добавления пользователя
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      become: yes
+
+    - name: Проверить доступные Docker сети
+      ansible.builtin.shell: docker network ls
+      register: docker_networks
+      changed_when: false
+
+    - name: Создать Docker сеть для мониторинга
+      community.docker.docker_network:
+        name: prometheus-net
+        state: present
+      become: yes
+
+    - name: Показать Docker сети
+      ansible.builtin.debug:
+        var: docker_networks.stdout_lines
+
+    - name: Создать директории для Prometheus с правильными правами
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default('65534') }}"
+        group: "{{ item.group | default('65534') }}"
+        mode: '0755'
+      loop:
+        - { path: /opt/prometheus }
+        - { path: /opt/prometheus/data, owner: 65534, group: 65534 }
+        - { path: /opt/node-exporter }
+        - { path: /opt/grafana, owner: 472, group: 472 }
+
+    - name: Создать prometheus.yml конфигурацию (Docker DNS)
+      ansible.builtin.copy:
+        dest: /opt/prometheus/prometheus.yml
+        content: |
+          global:
+            scrape_interval: 15s
+          scrape_configs:
+            - job_name: 'prometheus'
+              static_configs:
+                - targets: ['localhost:9090']
+            - job_name: 'node'
+              static_configs:
+                - targets: ['node-exporter:9100']
+        owner: 65534
+        group: 65534
+        mode: '0644'
+      notify: restart prometheus
+
+    - name: Запустить Prometheus контейнер
+      ansible.builtin.docker_container:
+        name: prometheus
+        image: prom/prometheus:latest
+        state: started
+        restart_policy: always
+        ports:
+          - "9090:9090"
+        volumes:
+          - /opt/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+          - /opt/prometheus/data:/prometheus
+        networks:
+          - name: prometheus-net
+        user: "65534:65534"
+      notify: restart prometheus
+
+    - name: Запустить Node Exporter контейнер
+      ansible.builtin.docker_container:
+        name: node-exporter
+        image: prom/node-exporter:latest
+        state: started
+        restart_policy: always
+        ports:
+          - "9100:9100"
+        volumes:
+          - /proc:/host/proc:ro
+          - /sys:/host/sys:ro
+          - /:/rootfs:ro
+        command: --path.procfs=/host/proc --path.sysfs=/host/sys --path.rootfs=/rootfs
+        networks:
+          - name: prometheus-net
+
+    - name: Создать grafana.ini конфигурацию (ОБЯЗАТЕЛЬНО!)
+      ansible.builtin.copy:
+        dest: /opt/grafana/grafana.ini
+        content: |
+          [server]
+          http_port = 3000
+          
+          [security]
+          admin_user = "{{ grafana_user }}"
+          admin_password = "{{ grafana_passwd }}"
+          
+          [users]
+          allow_sign_up = false
+        owner: 472
+        group: 472
+        mode: '0644'
+      notify: restart grafana
+
+    - name: Запустить Grafana контейнер
+      ansible.builtin.docker_container:
+        name: grafana
+        image: grafana/grafana:latest
+        state: started
+        restart_policy: always
+        ports:
+          - "3001:3000"
+        volumes:
+          - /opt/grafana/grafana.ini:/etc/grafana/grafana.ini
+          - /opt/grafana:/var/lib/grafana
+        networks:
+          - name: prometheus-net
+        user: "472:472"
+        env:
+          GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_passwd }}"
+          GF_USERS_ALLOW_SIGN_UP: "false"
+      notify: restart grafana
+
+    - name: Создать директории Alertmanager
+      ansible.builtin.file:
+        path: /opt/alertmanager
+        state: directory
+        owner: 65534
+        group: 65534
+        mode: '0755'
+
+    - name: Создать Alertmanager config (РАБОЧИЙ)
+      ansible.builtin.copy:
+        dest: /opt/alertmanager/config.yml
+        content: |
+          global:
+            resolve_timeout: 5m
+          route:
+            group_by: ['alertname']
+            group_wait: 30s
+            repeat_interval: 12h
+            receiver: 'null'
+          receivers:
+          - name: 'null'
+        owner: 65534
+        group: 65534
+        mode: '0644'
+
+    - name: Запустить Alertmanager
+      ansible.builtin.docker_container:
+        name: alertmanager
+        image: prom/alertmanager:latest
+        state: started
+        restart_policy: always
+        ports:
+          - "9093:9093"
+        volumes:
+          - /opt/alertmanager/config.yml:/etc/alertmanager/config.yml
+          - /opt/alertmanager:/alertmanager
+        networks:
+          - name: prometheus-net
+        user: "65534:65534"
+
+    - name: Установить UFW если не установлен
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+
+    - name: Разрешить порты мониторинга в UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - 22
+        - 9090
+        - 9100
+        - 3001
+        - 9093
+
+    - name: Включить UFW
+      community.general.ufw:
+        state: enabled
+        policy: deny
+
+    - name: Применить handlers
+      ansible.builtin.meta: flush_handlers
+
+  handlers:
+    - name: restart prometheus
+      ansible.builtin.docker_container:
+        name: prometheus
+        state: started
+        restart: yes
+
+    - name: restart grafana
+      ansible.builtin.docker_container:
+        name: grafana
+        state: started
+        restart: yes
